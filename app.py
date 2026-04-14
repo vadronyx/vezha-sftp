@@ -2,57 +2,79 @@ import sys
 import os
 import stat
 import paramiko
+import urllib.request
+import json
+import webbrowser
+import posixpath
+import threading
+import binascii
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLineEdit, QPushButton, QListWidget,
                              QSplitter, QTreeView, QTextEdit, QProgressBar,
                              QListWidgetItem, QMessageBox, QAbstractItemView)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDir
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDir, QTimer
 from PyQt6.QtGui import QIcon, QFileSystemModel, QAction
+
+CURRENT_VERSION = "1.0.1"
+GITHUB_REPO = "vadronyx/Vezha-SFTP"
+
+
+class CancelledError(Exception):
+    pass
+
+
+class InteractivePolicy(paramiko.MissingHostKeyPolicy):
+    def __init__(self, worker):
+        self.worker = worker
+
+    def missing_host_key(self, client, hostname, key):
+        hex_fp = binascii.hexlify(key.get_fingerprint()).decode('utf-8')
+        fingerprint = ':'.join(hex_fp[i:i + 2] for i in range(0, len(hex_fp), 2))
+        key_type = key.get_name()
+
+        self.worker.trust_event.clear()
+        self.worker.trust_answer = False
+        self.worker.ask_trust_signal.emit(hostname, key_type, fingerprint)
+
+        self.worker.trust_event.wait()
+
+        if self.worker.trust_answer:
+            client._host_keys.add(hostname, key.get_name(), key)
+            filename = client._host_keys_filename
+            if not filename:
+                filename = os.path.expanduser('~/.ssh/known_hosts')
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            client.save_host_keys(filename)
+            return
+        else:
+            raise paramiko.SSHException(f"Connection rejected by user. Untrusted host key for {hostname}.")
+
 
 STYLE_SHEET = """
 QMainWindow { background-color: #1e1e1e; }
 QWidget { color: #cccccc; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
-
-QLineEdit { 
-    background-color: #2d2d30; border: 1px solid #3f3f46; 
-    padding: 6px; border-radius: 3px; color: #ffffff;
-}
+QLineEdit { background-color: #2d2d30; border: 1px solid #3f3f46; padding: 6px; border-radius: 3px; color: #ffffff; }
 QLineEdit:focus { border: 1px solid #007acc; }
-
-QPushButton { 
-    background-color: #007acc; color: white; border: none; 
-    padding: 7px 15px; border-radius: 3px; font-weight: bold;
-}
+QPushButton { background-color: #007acc; color: white; border: none; padding: 7px 15px; border-radius: 3px; font-weight: bold; }
 QPushButton:hover { background-color: #0098ff; }
 QPushButton:pressed { background-color: #005c99; }
 QPushButton:disabled { background-color: #555555; color: #888888; }
 QPushButton#disconnectBtn { background-color: #9e2a2b; }
 QPushButton#disconnectBtn:hover { background-color: #b23b3c; }
-
-QListWidget, QTreeView, QTextEdit { 
-    background-color: #252526; border: 1px solid #3f3f46; 
-    border-radius: 3px; outline: none; padding: 2px;
-}
+QListWidget, QTreeView, QTextEdit { background-color: #252526; border: 1px solid #3f3f46; border-radius: 3px; outline: none; padding: 2px; }
 QListWidget::item, QTreeView::item { padding: 4px; }
-QListWidget::item:selected, QTreeView::item:selected { 
-    background-color: #37373d; color: #ffffff; border: 1px solid #007acc;
-}
-
+QListWidget::item:selected, QTreeView::item:selected { background-color: #37373d; color: #ffffff; border: 1px solid #007acc; }
 QSplitter::handle { background-color: #3f3f46; margin: 2px; }
 QHeaderView::section { background-color: #2d2d30; color: #cccccc; padding: 4px; border: 1px solid #3f3f46; }
-
-QProgressBar {
-    background-color: #2d2d30; border: 1px solid #3f3f46; border-radius: 3px;
-    text-align: center; color: white; font-weight: bold;
-}
+QProgressBar { background-color: #2d2d30; border: 1px solid #3f3f46; border-radius: 3px; text-align: center; color: white; font-weight: bold; }
 QProgressBar::chunk { background-color: #007acc; border-radius: 2px; }
-
 QMenuBar { background-color: #2d2d30; color: #cccccc; border-bottom: 1px solid #3f3f46; }
 QMenuBar::item:selected { background-color: #3f3f46; }
 QMenu { background-color: #252526; color: #cccccc; border: 1px solid #3f3f46; }
 QMenu::item:selected { background-color: #007acc; color: white; }
 """
+
 
 class RemoteFileList(QListWidget):
     file_dropped = pyqtSignal(str)
@@ -77,88 +99,166 @@ class RemoteFileList(QListWidget):
     def dropEvent(self, event):
         for url in event.mimeData().urls():
             file_path = url.toLocalFile()
-            if os.path.isfile(file_path):
-                self.file_dropped.emit(file_path)
-            elif os.path.isdir(file_path):
-                # TODO: фіча на майбутнє. Поки що ігнорую, щоб не ускладнювати рекурсію.
-                pass
+            if os.path.isfile(file_path): self.file_dropped.emit(file_path)
+
 
 class SFTPWorker(QThread):
-    finished = pyqtSignal(list)
+    directory_loaded = pyqtSignal(list)
+    transfer_completed = pyqtSignal()
     error = pyqtSignal(str)
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)
+    ask_trust_signal = pyqtSignal(str, str, str)
 
-    def __init__(self, config, action="list", remote_path=".", local_path=None, file_name=None):
-        super().__init__()
-        self.config = config
+    def __init__(self, host, port, user, password, action="list", remote_path=".", local_path=None, file_name=None,
+                 parent=None):
+        super().__init__(parent)
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
         self.action = action
         self.remote_path = remote_path
         self.local_path = local_path
         self.file_name = file_name
+        self._is_cancelled = False
+
+        self.trust_event = threading.Event()
+        self.trust_answer = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def progress_callback(self, transferred, total):
+        if self._is_cancelled:
+            raise CancelledError("Operation cancelled by user.")
+        self.progress.emit(transferred, total)
 
     def run(self):
+        client = None
+        sftp = None
         try:
-            transport = paramiko.Transport((self.config['host'], int(self.config['port'])))
-            transport.banner_timeout = 5
+            client = paramiko.SSHClient()
+            client.load_system_host_keys()
+            client.set_missing_host_key_policy(InteractivePolicy(self))
 
-            try:
-                transport.connect(username=self.config['user'], password=self.config['pass'])
-            except paramiko.AuthenticationException:
-                self.error.emit("Login or password incorrect!")
-                return
-            except Exception as e:
-                self.error.emit(f"Failed to connect: {str(e)}")
-                return
+            client.connect(
+                hostname=self.host,
+                port=int(self.port),
+                username=self.user,
+                password=self.password,
+                timeout=5,
+                banner_timeout=5,
+                auth_timeout=5
+            )
+            self.password = None
 
-            sftp = paramiko.SFTPClient.from_transport(transport)
+            sftp = client.open_sftp()
 
             if self.action == "list":
                 self.log.emit(f"Reading directory: {self.remote_path}")
                 items = []
                 for attr in sftp.listdir_attr(self.remote_path):
+                    if self._is_cancelled: raise CancelledError("Operation cancelled by user.")
                     is_dir = stat.S_ISDIR(attr.st_mode)
                     items.append((attr.filename, is_dir))
 
                 folders = sorted([i for i in items if i[1]], key=lambda x: x[0].lower())
                 files = sorted([i for i in items if not i[1]], key=lambda x: x[0].lower())
-                self.finished.emit([("..", True)] + folders + files)
+                self.directory_loaded.emit([("..", True)] + folders + files)
 
             elif self.action == "download":
-                remote_target = os.path.join(self.remote_path, self.file_name).replace("\\", "/")
+                remote_target = posixpath.join(self.remote_path, self.file_name)
                 local_target = os.path.join(self.local_path, self.file_name)
+
                 self.log.emit(f"Downloading: {self.file_name}")
-                sftp.get(remote_target, local_target, callback=lambda t, total: self.progress.emit(t, total))
+                sftp.get(remote_target, local_target, callback=self.progress_callback)
                 self.log.emit("Download complete.")
-                self.finished.emit([])
+                self.transfer_completed.emit()
 
             elif self.action == "upload":
-                remote_target = os.path.join(self.remote_path, self.file_name).replace("\\", "/")
-                self.log.emit(f"Uploading: {self.file_name}")
-                sftp.put(self.local_path, remote_target, callback=lambda t, total: self.progress.emit(t, total))
-                self.log.emit("Upload complete.")
-                self.finished.emit([])
+                remote_target = posixpath.join(self.remote_path, self.file_name)
 
-            sftp.close()
-            transport.close()
-        except Exception as e:
+                self.log.emit(f"Uploading: {self.file_name}")
+                sftp.put(self.local_path, remote_target, callback=self.progress_callback)
+                self.log.emit("Upload complete.")
+                self.transfer_completed.emit()
+
+        except CancelledError as e:
             self.error.emit(str(e))
+        except paramiko.AuthenticationException:
+            self.error.emit("Login or password incorrect!")
+        except paramiko.SSHException as e:
+            self.error.emit(f"SSH Error: {str(e)}")
+        except OSError as e:
+            self.error.emit(f"Network Error: {str(e)}")
+        except Exception as e:
+            self.error.emit(f"Unexpected Error: {str(e)}")
+        finally:
+            if sftp: sftp.close()
+            if client: client.close()
+
+
+class UpdateChecker(QThread):
+    update_available = pyqtSignal(str, str)
+
+    def parse_version(self, v_string):
+        clean_v = v_string.lower().lstrip('v').strip()
+        try:
+            return tuple(map(int, clean_v.split('.')))
+        except ValueError:
+            return (0, 0, 0)
+
+    def run(self):
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers={'User-Agent': 'VezhaSFTP-Client'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                latest_version = data["tag_name"]
+                if self.parse_version(latest_version) > self.parse_version(CURRENT_VERSION):
+                    self.update_available.emit(latest_version, data["html_url"])
+        except Exception:
+            pass
 
 
 class EnSFTPApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Vezha SFTP")
+        self.setWindowTitle(f"Vezha SFTP v{CURRENT_VERSION}")
         self.setMinimumSize(1000, 700)
         self.setStyleSheet(STYLE_SHEET)
 
         self.current_remote_path = "."
         self.init_ui()
         self.create_menu_bar()
+        self.check_for_updates()
+
+    def is_worker_active(self):
+        if getattr(self, "worker", None) is None:
+            return False
+        try:
+            return self.worker.isRunning()
+        except RuntimeError:
+            self.worker = None
+            return False
+
+    def check_for_updates(self):
+        self.updater = UpdateChecker(parent=self)
+        self.updater.update_available.connect(self.prompt_update)
+        self.updater.finished.connect(self.updater.deleteLater)
+        self.updater.start()
+
+    def prompt_update(self, version, url):
+        reply = QMessageBox.question(
+            self, "Update Available",
+            f"A new version of VezhaSFTP ({version}) is available!\n\nDo you want to download it from GitHub?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes: webbrowser.open(url)
 
     def create_menu_bar(self):
         menubar = self.menuBar()
-
         file_menu = menubar.addMenu("File")
         exit_action = QAction("Exit", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -274,32 +374,56 @@ class EnSFTPApp(QMainWindow):
         scrollbar = self.log_console.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def get_config(self):
-        return {
-            'host': self.host_input.text(),
-            'port': self.port_input.text(),
-            'user': self.user_input.text(),
-            'pass': self.pass_input.text()
-        }
+    def set_ui_locked(self, locked):
+        self.connect_btn.setEnabled(not locked)
+        self.upload_btn.setEnabled(not locked)
+        self.download_btn.setEnabled(not locked)
+
+    def ask_host_trust(self, hostname, key_type, fingerprint):
+        msg = f"The server's host key is unknown.\n\nServer: {hostname}\nKey Type: {key_type}\nFingerprint: {fingerprint}\n\nDo you trust this host and want to add it to known_hosts?"
+        reply = QMessageBox.warning(
+            self, "Unknown Host Key", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if self.is_worker_active():
+            self.worker.trust_answer = (reply == QMessageBox.StandardButton.Yes)
+            self.worker.trust_event.set()
 
     def start_connect(self):
-        if not self.host_input.text():
-            self.log("Error: Host address is empty!")
+        if self.is_worker_active():
             return
 
+        if not self.host_input.text():
+            self.log("[ERROR]: Host address is empty!")
+            return
+
+        self.set_ui_locked(True)
         self.log("Connecting to server...")
-        self.worker = SFTPWorker(self.get_config(), "list", self.current_remote_path)
-        self.worker.finished.connect(self.update_list)
-        self.worker.error.connect(self.handle_error)
+
+        self.worker = SFTPWorker(
+            self.host_input.text(), self.port_input.text(),
+            self.user_input.text(), self.pass_input.text(),
+            "list", self.current_remote_path, parent=self
+        )
+
+        self.worker.ask_trust_signal.connect(self.ask_host_trust)
         self.worker.log.connect(self.log)
+        self.worker.error.connect(self.handle_error)
+        self.worker.directory_loaded.connect(self.update_list)
+        self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
 
     def disconnect_server(self):
-        """Clear list, reset session connection"""
+        if self.is_worker_active():
+            self.log("Cancelling active operations...")
+            self.worker.cancel()
+            self.worker.wait(3000)
+
         self.remote_list.clear()
-        self.current_remote_path = "."
-        self.log("Disconnected from server.")
+        self.log("Disconnected from server. Session saved.")
         self.progress_bar.hide()
+        self.set_ui_locked(False)
 
     def update_list(self, files):
         self.remote_list.clear()
@@ -317,18 +441,16 @@ class EnSFTPApp(QMainWindow):
             self.remote_list.addItem(item)
 
         self.log(f"Current directory: {self.current_remote_path}")
+        self.set_ui_locked(False)
 
     def change_directory(self, item):
         if item.data(Qt.ItemDataRole.UserRole) != "dir": return
         name = item.text()
         if name == "..":
-            self.current_remote_path = "/".join(self.current_remote_path.rstrip("/").split("/")[:-1])
+            self.current_remote_path = posixpath.dirname(self.current_remote_path)
             if not self.current_remote_path: self.current_remote_path = "/"
         else:
-            if self.current_remote_path == "/":
-                self.current_remote_path += name
-            else:
-                self.current_remote_path += f"/{name}"
+            self.current_remote_path = posixpath.join(self.current_remote_path, name)
         self.start_connect()
 
     def update_progress(self, transferred, total):
@@ -339,7 +461,7 @@ class EnSFTPApp(QMainWindow):
     def transfer_finished(self):
         self.progress_bar.hide()
         self.progress_bar.setValue(0)
-        self.start_connect()
+        QTimer.singleShot(100, self.start_connect)
 
     def download_file(self):
         item = self.remote_list.currentItem()
@@ -370,34 +492,49 @@ class EnSFTPApp(QMainWindow):
         self.start_worker_task("upload", self.current_remote_path, local_info.absoluteFilePath(), local_info.fileName())
 
     def upload_dropped_file(self, file_path):
-        """Action when file is uploaded via Drag & Drop"""
         file_name = os.path.basename(file_path)
         self.log(f"Uploading file via Drag & Drop: {file_name}")
         self.start_worker_task("upload", self.current_remote_path, file_path, file_name)
 
     def start_worker_task(self, action, remote_path, local_path, file_name):
+        if self.is_worker_active():
+            return
+
+        self.set_ui_locked(True)
         self.progress_bar.show()
         self.progress_bar.setValue(0)
-        self.worker = SFTPWorker(self.get_config(), action, remote_path, local_path, file_name)
+
+        self.worker = SFTPWorker(
+            self.host_input.text(), self.port_input.text(),
+            self.user_input.text(), self.pass_input.text(),
+            action, remote_path, local_path, file_name, parent=self
+        )
+
+        self.worker.ask_trust_signal.connect(self.ask_host_trust)
         self.worker.log.connect(self.log)
         self.worker.progress.connect(self.update_progress)
         self.worker.error.connect(self.handle_error)
-        self.worker.finished.connect(self.transfer_finished)
+        self.worker.transfer_completed.connect(self.transfer_finished)
+        self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
 
     def handle_error(self, err):
-        self.log(f"Error: {err}")
+        self.log(f"[ERROR]: {err}")
         self.progress_bar.hide()
-        QMessageBox.critical(self, "Connection Error", err)
+        self.set_ui_locked(False)
+
+        if "cancelled by user" not in str(err) and "Connection rejected" not in str(err):
+            QMessageBox.critical(self, "Error", err)
 
     def show_about(self):
         text = (
-            "<h2>Vezha-SFTP Client</h2>"
-            "<p>A simple program for working with SFTP servers.</p>"
-            "<p><b>Version:</b> 1.0 (Stable)<br>"
-            "<b>Developer:</b> Vadronyx Dev</p>"
+            "<h2>VezhaSFTP Client</h2>"
+            "<p>A professional lightweight program for working with SFTP servers.</p>"
+            f"<p><b>Version:</b> {CURRENT_VERSION}<br>"
+            "<b>Developer:</b> vadronyx</p>"
         )
         QMessageBox.about(self, "About Program", text)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
