@@ -49,7 +49,7 @@ VezhaSFTP is built to be fast, dark, and dependable. It features a custom-engine
 | :--- | :--- | :--- |
 | **Native .deb** | ✅ Available | Debian / Ubuntu / Mint |
 | **AppImage** | ⏳ In Progress | Universal Linux |
-| **Standalone .exe** | ⏳ Planned | Windows 10/11 |
+| **Standalone .exe** | ✅ Available | Windows 10/11 |
 | **Source Code** | ✅ Available | Cross-platform |
 
 ---
