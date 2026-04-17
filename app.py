@@ -15,8 +15,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDir, QTimer, QEventLoop
 from PyQt6.QtGui import QIcon, QFileSystemModel, QAction
 
-CURRENT_VERSION = "1.0.2"
-GITHUB_REPO = "vadronyx/Vezha-SFTP"
+CURRENT_VERSION = "1.0.3"
+GITHUB_REPO = "vadronyx/VezhaSFTP"
 
 
 class CancelledError(Exception):
@@ -33,11 +33,11 @@ class InteractivePolicy(paramiko.MissingHostKeyPolicy):
         fingerprint = ':'.join(hex_fp[i:i + 2] for i in range(0, len(hex_fp), 2))
         key_type = key.get_name()
 
+        self.worker.log.emit(f"[SECURITY] New host key detected for {hostname}: {fingerprint}")
         self.worker.log.emit("Awaiting host key confirmation...")
+
         self.worker._trust_answer = None
-
         loop = QEventLoop()
-
         self.worker.trust_resolved.connect(loop.quit)
 
         timeout_timer = QTimer()
@@ -130,7 +130,10 @@ class SFTPWorker(QThread):
     progress = pyqtSignal(int, int)
 
     ask_trust_signal = pyqtSignal(str, str, str)
-    trust_resolved = pyqtSignal() 
+    trust_resolved = pyqtSignal()
+
+    ask_large_file_signal = pyqtSignal(str, int)
+    large_file_resolved = pyqtSignal()
 
     def __init__(self, host, port, user, password, action="list", remote_path=".", local_path=None, file_name=None,
                  parent=None):
@@ -138,7 +141,7 @@ class SFTPWorker(QThread):
         self.host = host
         self.port = port
         self.user = user
-        self.password = password
+        self.password = password  # ?????????? ?????????
         self.action = action
         self.remote_path = remote_path
         self.local_path = local_path
@@ -146,23 +149,46 @@ class SFTPWorker(QThread):
 
         self._is_cancelled = False
         self._trust_answer = None
+        self._large_file_answer = None
 
     def cancel(self):
         self._is_cancelled = True
         self.trust_resolved.emit()
+        self.large_file_resolved.emit()
 
     def set_trust_response(self, answer):
         self._trust_answer = answer
         self.trust_resolved.emit()
+
+    def set_large_file_response(self, answer):
+        self._large_file_answer = answer
+        self.large_file_resolved.emit()
 
     def progress_callback(self, transferred, total):
         if self._is_cancelled:
             raise CancelledError("Operation cancelled by user.")
         self.progress.emit(transferred, total)
 
+    def check_large_file(self, file_size):
+        LARGE_FILE_LIMIT = 500 * 1024 * 1024  # 500 MB
+        if file_size > LARGE_FILE_LIMIT:
+            self._large_file_answer = None
+            loop = QEventLoop()
+            self.large_file_resolved.connect(loop.quit)
+            self.ask_large_file_signal.emit(self.file_name, file_size)
+            loop.exec()
+
+            if self._is_cancelled or not self._large_file_answer:
+                raise CancelledError(f"Transfer of large file '{self.file_name}' cancelled by user.")
+
     def run(self):
         client = None
         sftp = None
+
+        # Memory Safety: ??????????? ?????? ? ???????? ?????? ? ????????? ??????? ??'????
+        temp_password = self.password
+        self.password = None
+
         try:
             client = paramiko.SSHClient()
             client.load_system_host_keys()
@@ -172,12 +198,13 @@ class SFTPWorker(QThread):
                 hostname=self.host,
                 port=int(self.port),
                 username=self.user,
-                password=self.password,
-                timeout=5,
-                banner_timeout=5,
-                auth_timeout=5
+                password=temp_password,
+                timeout=10,
+                banner_timeout=10,
+                auth_timeout=10
             )
-            self.password = None
+            # Memory Safety: ????????? ???????? ?????? ????? ?'???????
+            temp_password = None
 
             sftp = client.open_sftp()
 
@@ -197,6 +224,9 @@ class SFTPWorker(QThread):
                 remote_target = posixpath.join(self.remote_path, self.file_name)
                 local_target = os.path.join(self.local_path, self.file_name)
 
+                attr = sftp.stat(remote_target)
+                self.check_large_file(attr.st_size)
+
                 self.log.emit(f"Downloading: {self.file_name}")
                 sftp.get(remote_target, local_target, callback=self.progress_callback)
                 self.log.emit("Download complete.")
@@ -204,6 +234,9 @@ class SFTPWorker(QThread):
 
             elif self.action == "upload":
                 remote_target = posixpath.join(self.remote_path, self.file_name)
+
+                file_size = os.path.getsize(self.local_path)
+                self.check_large_file(file_size)
 
                 self.log.emit(f"Uploading: {self.file_name}")
                 sftp.put(self.local_path, remote_target, callback=self.progress_callback)
@@ -238,7 +271,7 @@ class UpdateChecker(QThread):
     def run(self):
         try:
             url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-            req = urllib.request.Request(url, headers={'User-Agent': 'VezhaSFTP-Client'})
+            req = urllib.request.Request(url, headers={'User-Agent': f'VezhaSFTP-Client-v{CURRENT_VERSION}'})
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode())
                 latest_version = data["tag_name"]
@@ -279,6 +312,7 @@ class EnSFTPApp(QMainWindow):
         self.updater.start()
 
     def prompt_update(self, version, url):
+        self.log(f"[UPDATE] New version {version} is available on GitHub!")
         reply = QMessageBox.question(
             self, "Update Available",
             f"A new version of VezhaSFTP ({version}) is available!\n\nDo you want to download it from GitHub?",
@@ -427,7 +461,11 @@ class EnSFTPApp(QMainWindow):
         worker = getattr(self, "worker", None)
         if not worker: return
 
-        msg = f"The server's host key is unknown.\n\nServer: {hostname}\nKey Type: {key_type}\nFingerprint: {fingerprint}\n\nDo you trust this host and want to add it to known_hosts?"
+        msg = (f"SECURITY WARNING: The server's host key is unknown!\n\n"
+               f"Server: {hostname}\nKey Type: {key_type}\nFingerprint: {fingerprint}\n\n"
+               f"?? This could be a MITM (Man-in-the-Middle) attack if you were expecting a known server.\n\n"
+               f"Do you trust this host and want to add it to known_hosts?")
+
         reply = QMessageBox.warning(
             self, "Unknown Host Key", msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
@@ -436,6 +474,26 @@ class EnSFTPApp(QMainWindow):
         try:
             if worker and worker.isRunning():
                 worker.set_trust_response(reply == QMessageBox.StandardButton.Yes)
+        except RuntimeError:
+            pass
+
+    def ask_large_file(self, filename, size_bytes):
+        worker = getattr(self, "worker", None)
+        if not worker: return
+
+        size_mb = size_bytes / (1024 * 1024)
+        msg = (f"The file '{filename}' is quite large ({size_mb:.2f} MB).\n\n"
+               f"Transferring large files may take a considerable amount of time. "
+               f"Do you want to proceed?")
+
+        reply = QMessageBox.question(
+            self, "Large File Transfer", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        try:
+            if worker and worker.isRunning():
+                worker.set_large_file_response(reply == QMessageBox.StandardButton.Yes)
         except RuntimeError:
             pass
 
@@ -461,7 +519,7 @@ class EnSFTPApp(QMainWindow):
         self.current_remote_path = "."
 
         self.set_session_state(False)
-        self.connect_btn.setEnabled(False) 
+        self.connect_btn.setEnabled(False)
         self.log("Connecting to server...")
 
         self.worker = SFTPWorker(
@@ -599,6 +657,8 @@ class EnSFTPApp(QMainWindow):
             action, remote_path, local_path, file_name, parent=self
         )
 
+        self.worker.ask_trust_signal.connect(self.ask_host_trust)
+        self.worker.ask_large_file_signal.connect(self.ask_large_file)
         self.worker.log.connect(self.log)
         self.worker.progress.connect(self.update_progress)
         self.worker.error.connect(self.handle_error)
@@ -632,8 +692,28 @@ class EnSFTPApp(QMainWindow):
 
 
 if __name__ == "__main__":
+    # ??????????? ??? ??? ?????? ??????? Windows
+    import ctypes
+
+    try:
+        myappid = f'vadronyx.vezhasftp.client.{CURRENT_VERSION.replace(".", "_")}'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+
+    def get_resource_path(relative_path):
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, relative_path)
+        return os.path.join(os.path.abspath("."), relative_path)
+
+
+    icon_path = get_resource_path("icon.ico")
+    app.setWindowIcon(QIcon(icon_path))
+
     window = EnSFTPApp()
     window.show()
     sys.exit(app.exec())
